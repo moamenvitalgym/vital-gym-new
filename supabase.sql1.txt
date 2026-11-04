@@ -1,0 +1,175 @@
+-- Vital Gym - FRESH INSTALL (paste this whole file into Supabase > SQL Editor and click Run, once).
+-- Do NOT run it again on a project that already has these tables.eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt4bmN4Z3p0cWFwaXV3aXJpZ3R1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMyMjk5MTAsImV4cCI6MjEwODgwNTkxMH0.naAD-UHnLByeH8jY-n-0sqTkeH56P6Aabo-lFW46oMM
+
+-- PART 1 of 2: base tables, helpers and permissions
+
+create table public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  username text unique not null,
+  name text,
+  role text not null default 'pending' check (role in ('pending','user','admin')),
+  created_at timestamptz default now()
+);
+create table public.settings (key text primary key, value jsonb not null);
+create table public.staff     (id uuid primary key default gen_random_uuid(), data jsonb not null, created_at timestamptz default now());
+create table public.floor_log (id uuid primary key default gen_random_uuid(), data jsonb not null, created_at timestamptz default now());
+create table public.rec_log   (id uuid primary key default gen_random_uuid(), data jsonb not null, created_at timestamptz default now());
+
+alter table public.profiles  enable row level security;
+alter table public.settings  enable row level security;
+alter table public.staff     enable row level security;
+alter table public.floor_log enable row level security;
+alter table public.rec_log   enable row level security;
+
+insert into public.settings(key,value) values
+ ('perms','{"add":1,"edit":1,"status":1,"del":0,"rep":1,"staff":1}');
+
+-- helpers
+create or replace function public.is_admin() returns boolean language sql security definer stable set search_path=public as
+$$ select exists(select 1 from public.profiles where id=auth.uid() and role='admin') $$;
+
+create or replace function public.is_member() returns boolean language sql security definer stable set search_path=public as
+$$ select exists(select 1 from public.profiles where id=auth.uid() and role in ('user','admin')) $$;
+
+create or replace function public.can_do(p text) returns boolean language sql security definer stable set search_path=public as
+$$ select public.is_admin() or (public.is_member() and coalesce((select (value->>p)::int=1 from public.settings where key='perms'),false)) $$;
+
+create or replace function public.has_users() returns boolean language sql security definer stable set search_path=public as
+$$ select exists(select 1 from public.profiles) $$;
+grant execute on function public.has_users() to anon, authenticated;
+
+-- first account becomes admin, every later signup waits for approval
+create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$
+begin
+  insert into public.profiles(id,username,name,role)
+  values (new.id, split_part(new.email,'@',1),
+          coalesce(new.raw_user_meta_data->>'name', split_part(new.email,'@',1)),
+          case when exists(select 1 from public.profiles) then 'pending' else 'admin' end);
+  return new;
+end $$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.handle_new_user();
+
+-- admin-only account actions
+create or replace function public.admin_set_password(uid uuid, pw text) returns void language plpgsql security definer set search_path=public, extensions as $$
+begin
+  if not public.is_admin() then raise exception 'not allowed'; end if;
+  if length(pw) < 6 then raise exception 'password too short'; end if;
+  update auth.users set encrypted_password = crypt(pw, gen_salt('bf')), updated_at = now() where id = uid;
+end $$;
+
+create or replace function public.admin_delete_user(uid uuid) returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not public.is_admin() then raise exception 'not allowed'; end if;
+  if uid = auth.uid() then raise exception 'cannot delete yourself'; end if;
+  delete from auth.users where id = uid;
+end $$;
+
+-- policies
+create policy profiles_sel on public.profiles for select to authenticated using (id = auth.uid() or public.is_member());
+create policy profiles_upd on public.profiles for update to authenticated using (public.is_admin()) with check (public.is_admin());
+
+create policy settings_sel on public.settings for select to authenticated using (public.is_member());
+create policy settings_ins on public.settings for insert to authenticated with check (public.is_admin() or (key='lists' and public.can_do('add')));
+create policy settings_upd on public.settings for update to authenticated using (public.is_admin() or (key='lists' and public.can_do('add'))) with check (public.is_admin() or (key='lists' and public.can_do('add')));
+
+create policy staff_sel on public.staff for select to authenticated using (public.is_member());
+create policy staff_ins on public.staff for insert to authenticated with check (public.is_admin());
+create policy staff_upd on public.staff for update to authenticated using (public.is_admin()) with check (public.is_admin());
+create policy staff_del on public.staff for delete to authenticated using (public.is_admin());
+
+do $$ declare t text; begin
+  foreach t in array array['floor_log','rec_log'] loop
+    execute format('create policy %I on public.%I for select to authenticated using (public.is_member())', t||'_s', t);
+    execute format('create policy %I on public.%I for insert to authenticated with check (public.can_do(''add''))', t||'_i', t);
+    execute format('create policy %I on public.%I for update to authenticated using (public.can_do(''edit'') or public.can_do(''status'')) with check (public.can_do(''edit'') or public.can_do(''status''))', t||'_u', t);
+    execute format('create policy %I on public.%I for delete to authenticated using (public.can_do(''del''))', t||'_d', t);
+  end loop;
+end $$;
+
+
+-- PART 2 of 2: lockers + soft delete (data is never erased) + activity log
+
+alter table public.staff     add column if not exists deleted_at timestamptz;
+alter table public.floor_log add column if not exists deleted_at timestamptz;
+alter table public.rec_log   add column if not exists deleted_at timestamptz;
+
+create table if not exists public.locker_log (
+  id uuid primary key default gen_random_uuid(),
+  data jsonb not null,
+  created_at timestamptz default now(),
+  deleted_at timestamptz
+);
+alter table public.locker_log enable row level security;
+
+create table if not exists public.activity_log (
+  id bigint generated always as identity primary key,
+  at timestamptz not null default now(),
+  uid uuid, uname text, tbl text, op text, row_id text,
+  old_data jsonb, new_data jsonb
+);
+alter table public.activity_log enable row level security;
+drop policy if exists activity_sel on public.activity_log;
+create policy activity_sel on public.activity_log for select to authenticated using (public.is_admin());
+-- no insert/update/delete policies: only triggers write here, nobody can edit or erase it through the API
+
+-- hard deletes are no longer allowed from the app
+drop policy if exists floor_log_d on public.floor_log;
+drop policy if exists rec_log_d   on public.rec_log;
+drop policy if exists staff_del   on public.staff;
+
+-- data tables policies (incl. lockers); "delete" = set deleted_at
+do $$ declare t text; begin
+  foreach t in array array['floor_log','rec_log','locker_log'] loop
+    execute format('drop policy if exists %I on public.%I', t||'_s', t);
+    execute format('drop policy if exists %I on public.%I', t||'_i', t);
+    execute format('drop policy if exists %I on public.%I', t||'_u', t);
+    execute format('create policy %I on public.%I for select to authenticated using (public.is_member())', t||'_s', t);
+    execute format('create policy %I on public.%I for insert to authenticated with check (public.can_do(''add''))', t||'_i', t);
+    execute format('create policy %I on public.%I for update to authenticated using (public.can_do(''edit'') or public.can_do(''status'') or public.can_do(''del'')) with check (public.can_do(''edit'') or public.can_do(''status'') or public.can_do(''del''))', t||'_u', t);
+  end loop;
+end $$;
+
+-- only users with the delete permission can archive; only admin can restore
+create or replace function public.guard_soft_delete() returns trigger language plpgsql security definer set search_path=public as $$
+begin
+  if new.deleted_at is distinct from old.deleted_at then
+    if new.deleted_at is not null then
+      if not public.can_do('del') then raise exception 'not allowed to delete'; end if;
+    else
+      if not public.is_admin() then raise exception 'only admin can restore'; end if;
+    end if;
+  end if;
+  return new;
+end $$;
+
+-- who did what (written automatically by the database)
+create or replace function public.log_change() returns trigger language plpgsql security definer set search_path=public as $$
+declare o text; r jsonb; ro jsonb;
+begin
+  if tg_op = 'INSERT' then o := 'add'; r := to_jsonb(new);
+  elsif tg_op = 'UPDATE' then
+    ro := to_jsonb(old); r := to_jsonb(new);
+    if ro = r then return null; end if;
+    o := case when (ro->>'deleted_at') is null and (r->>'deleted_at') is not null then 'delete'
+              when (ro->>'deleted_at') is not null and (r->>'deleted_at') is null then 'restore'
+              else 'edit' end;
+  else o := 'remove'; ro := to_jsonb(old);
+  end if;
+  insert into public.activity_log(uid, uname, tbl, op, row_id, old_data, new_data)
+  values (auth.uid(),
+          coalesce((select name from public.profiles where id = auth.uid()), 'system'),
+          tg_table_name, o,
+          coalesce(r->>'id', ro->>'id', r->>'key', ro->>'key'), ro, r);
+  return null;
+end $$;
+
+do $$ declare t text; begin
+  foreach t in array array['floor_log','rec_log','locker_log','staff'] loop
+    execute format('drop trigger if exists %I on public.%I', t||'_guard', t);
+    execute format('create trigger %I before update on public.%I for each row execute function public.guard_soft_delete()', t||'_guard', t);
+  end loop;
+  foreach t in array array['floor_log','rec_log','locker_log','staff','settings','profiles'] loop
+    execute format('drop trigger if exists %I on public.%I', t||'_log', t);
+    execute format('create trigger %I after insert or update or delete on public.%I for each row execute function public.log_change()', t||'_log', t);
+  end loop;
+end $$;
